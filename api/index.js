@@ -3,13 +3,14 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const GEMINI_TIMEOUT_MS = 3000;
+const SEARCH_TIMEOUT_MS = 900; 
+const GEMINI_TIMEOUT_MS = 2400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных, опирайся на результаты поиска Gemini; не выдумывай отсутствующие факты.",
+  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -44,6 +45,10 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
+function isSearchIntent(text) {
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+}
+
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
   return history
@@ -64,7 +69,55 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, timeoutMs) {
+// УНИВЕРСАЛЬНЫЙ СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ API
+async function searchWebFree(query, timeoutMs) {
+  if (timeoutMs < 150) return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    // 1. DuckDuckGo Instant Answer API (факты, погода, справка)
+    const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&kl=ru-ru`;
+    const apiRes = await fetch(apiUrl, { signal: controller.signal });
+    if (apiRes.ok) {
+      const apiData = await apiRes.json().catch(() => ({}));
+      if (apiData.Answer) return `Ответ поисковика: ${apiData.Answer}`;
+      if (apiData.AbstractText) return `Информация: ${apiData.AbstractText}`;
+    }
+
+    // 2. Если мгновенный ответ пуст, ищем в открытом Google News RSS
+    const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ru&gl=RU&ceid=RU:ru`;
+    const rssRes = await fetch(rssUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    });
+
+    if (rssRes.ok) {
+      const xml = await rssRes.text();
+      const titles = [];
+      const regex = /<title>([\s\S]*?)<\/title>/g;
+      let match;
+      while ((match = regex.exec(xml)) !== null && titles.length < 4) {
+        const cleanTitle = match[1].replace(/<!\[CDATA\[\vert{}\]\]>/g, "").replace(/<[^>]*>/g, "").trim();
+        if (cleanTitle && !cleanTitle.includes("Google Новости")) {
+          titles.push(cleanTitle);
+        }
+      }
+      if (titles.length) {
+        return `Свежие данные из интернета:\n` + titles.map((t, i) => `${i + 1}. ${t}`).join("\n");
+      }
+    }
+
+    return "";
+  } catch (error) {
+    console.warn("Search timed out or failed:", error?.message);
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -77,7 +130,10 @@ async function askGemini(text, history, timeoutMs) {
     parts: [{ text: item.text }]
   }));
 
-  contents.push({ role: "user", parts: [{ text }] });
+  const prompt = searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+  contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -90,7 +146,6 @@ async function askGemini(text, history, timeoutMs) {
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
-        tools: [{ googleSearch: {} }], // <--- ВСТРОЕННЫЙ ПОИСК GOOGLE (Grounding)
         generationConfig: {
           temperature: 0.5,
           maxOutputTokens: 240
@@ -143,7 +198,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-grounding",
+      service: "alice-gemini-free-search",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -168,10 +223,16 @@ export default async function handler(req, res) {
   }
 
   try {
+    let searchContext = "";
+    if (isSearchIntent(text)) {
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2500)));
+    }
+
     const answer = await askGemini(
       text,
       oldHistory,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 400))
+      searchContext,
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 500))
     );
 
     const history = [
@@ -188,4 +249,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
