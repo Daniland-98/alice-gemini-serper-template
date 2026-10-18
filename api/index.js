@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для бесплатного поиска
+const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для поиска
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -69,36 +69,56 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// НАШ НОВЫЙ БЕСПЛАТНЫЙ И СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ DUCKDUCKGO
+// УЛУЧШЕННЫЙ БЕСПЛАТНЫЙ ПОИСК (API + Lite HTML)
 async function searchWebFree(query, timeoutMs) {
   if (timeoutMs < 150) return "";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const response = await fetch(searchUrl, {
-      method: "GET",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // 1. Сначала проверяем DuckDuckGo Instant Answer API (отлично для курсов валют, фактов и справок)
+    const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const apiRes = await fetch(apiUrl, { signal: controller.signal });
+    if (apiRes.ok) {
+      const apiData = await apiRes.json().catch(() => ({}));
+      if (apiData.AbstractText) {
+        return `Краткий факт: ${apiData.AbstractText}`;
       }
+      if (apiData.Answer) {
+        return `Ответ поисковика: ${apiData.Answer}`;
+      }
+      if (Array.isArray(apiData.RelatedTopics) && apiData.RelatedTopics.length > 0) {
+        const firstTopic = apiData.RelatedTopics.find(t => t.Text);
+        if (firstTopic && firstTopic.Text) {
+          return `Сведения: ${firstTopic.Text}`;
+        }
+      }
+    }
+
+    // 2. Если мгновенного ответа нет, запрашиваем DuckDuckGo Lite HTML (для новостей и общей выдачи)
+    const searchUrl = `https://lite.duckduckgo.com/lite/`;
+    const response = await fetch(searchUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      body: `q=${encodeURIComponent(query)}`,
+      signal: controller.signal
     });
 
     if (!response.ok) return "";
     const html = await response.text();
 
-    const blocks = html.split('class="result__body"').slice(1, 4);
-    const items = blocks.map((block, i) => {
-      const titleMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/) || block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
-      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-      
-      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 180) : "Сайт";
-      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 350) : "";
-      return `${i + 1}. ${title}: ${snippet}`.trim();
-    });
+    const snippets = [];
+    const regex = /<td class="result-snippet">([\s\S]*?)<\/td>/g;
+    let match;
+    while ((match = regex.exec(html)) !== null && snippets.length < 3) {
+      const cleanSnippet = match[1].replace(/<[^>]*>/g, "").trim();
+      if (cleanSnippet) snippets.push(cleanSnippet);
+    }
 
-    return items.length ? items.join("\n") : "";
+    return snippets.length ? snippets.map((s, i) => `${i + 1}. ${s}`).join("\n") : "";
   } catch (error) {
     console.warn("Free search failed or timed out:", error?.message);
     return "";
@@ -218,7 +238,6 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      // Выполняем бесплатный поиск без требования SERPER_API_KEY
       searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
