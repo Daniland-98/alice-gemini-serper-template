@@ -3,14 +3,14 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 400; // Уменьшен до 400 мс, чтобы не крашить тайм-аут Алисы
-const GEMINI_TIMEOUT_MS = 2800;
+const SEARCH_TIMEOUT_MS = 900; 
+const GEMINI_TIMEOUT_MS = 2400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Если вопрос требует актуальных данных и переданы результаты поиска или погоды, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -45,9 +45,8 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
-// Уточненная регулярка: ищем только ЯВНЫЕ запросы свежих данных
 function isSearchIntent(text) {
-  return /\b(сегодня|сейчас|последние новости|курс валют|курс доллара|погода|прогноз погоды)\b/i.test(text);
+  return /\b(сегодня|сейчас|последние новости|новости|курс валют|курс доллара|погода|прогноз погоды|узнай в интернете|найди в интернете)\b/i.test(text);
 }
 
 function safeHistory(history) {
@@ -70,22 +69,74 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// СВЕРХБЫСТРЫЙ ПОИСК С ТАЙМ-АУТОМ 400 МС
-async function searchWebFree(query, timeoutMs) {
-  if (timeoutMs < 100) return "";
-  
+// Поиск погоды через Open-Meteo API (Бесплатно, без API ключей)
+async function fetchWeather(city, timeoutMs) {
   try {
-    const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&kl=ru-ru`;
-    const { response, data } = await fetchJson(apiUrl, {}, timeoutMs);
+    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=ru`;
+    const { response: geoRes, data: geoData } = await fetchJson(geoUrl, {}, timeoutMs / 2);
     
-    if (response?.ok) {
-      if (data.Answer) return `Ответ: ${data.Answer}`;
-      if (data.AbstractText) return `Информация: ${data.AbstractText}`;
+    if (!geoRes?.ok || !geoData?.results?.[0]) return "";
+
+    const { latitude, longitude, name } = geoData.results[0];
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true&daily=temperature_2m_max,temperature_2m_min&timezone=auto`;
+    const { response: wRes, data: wData } = await fetchJson(weatherUrl, {}, timeoutMs / 2);
+
+    if (wRes?.ok && wData?.current_weather) {
+      const temp = wData.current_weather.temperature;
+      const max = wData.daily?.temperature_2m_max?.[0] ?? "";
+      const min = wData.daily?.temperature_2m_min?.[0] ?? "";
+      return `Данные о погоде в город ${name}: Текущая температура ${temp}°C. Днём ${max}°C, ночью ${min}°C.`;
     }
-    return "";
-  } catch {
-    return "";
+  } catch (e) {
+    console.warn("Weather API failed:", e?.message);
   }
+  return "";
+}
+
+// Поиск новостей и информации
+async function searchWebFree(query, timeoutMs) {
+  if (timeoutMs < 150) return "";
+
+  // Если запрос касается погоды, напрямую используем погодное API
+  if (/погода|прогноз/i.test(query)) {
+    const cityMatch = query.match(/(?:в|для)\s+([а-яА-Яa-zA-Z-]+)/i);
+    const city = cityMatch ? cityMatch[1] : "Барнаул";
+    const weatherData = await fetchWeather(city, timeoutMs);
+    if (weatherData) return weatherData;
+  }
+
+  // Для обычных запросов задействуем публичный RSS Google Новости
+  try {
+    const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ru&gl=RU&ceid=RU:ru`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const rssRes = await fetch(rssUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    });
+    clearTimeout(timer);
+
+    if (rssRes.ok) {
+      const xml = await rssRes.text();
+      const titles = [];
+      const regex = /<title>([\s\S]*?)<\/title>/g;
+      let match;
+      while ((match = regex.exec(xml)) !== null && titles.length < 4) {
+        const cleanTitle = match[1].replace(/<!\[CDATA\[\vert{}\]\]>/g, "").replace(/<[^>]*>/g, "").trim();
+        if (cleanTitle && !cleanTitle.includes("Google Новости")) {
+          titles.push(cleanTitle);
+        }
+      }
+      if (titles.length) {
+        return `Свежие данные из интернета:\n` + titles.map((t, i) => `${i + 1}. ${t}`).join("\n");
+      }
+    }
+  } catch (e) {
+    console.warn("RSS Search failed:", e?.message);
+  }
+
+  return "";
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -102,7 +153,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nАктуальные данные:\n${searchContext}\nИспользуй их для ответа.`
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
@@ -196,7 +247,7 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2800)));
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2500)));
     }
 
     const answer = await askGemini(
