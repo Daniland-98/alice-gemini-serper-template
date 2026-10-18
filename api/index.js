@@ -1,9 +1,9 @@
-const DEFAULT_MODEL = "gemini-2.5-pro";
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 800;
+const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для бесплатного поиска
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -27,7 +27,7 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function fitAliceText(value) {
   const text = String(value ?? "")
-    .replace(/[\(\r\\)n\t]+/g, " ")
+    .replace(/[\r\n\t]+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
 
@@ -69,7 +69,7 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// БЕСПЛАТНЫЙ И СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ DUCKDUCKGO HTML
+// НАШ НОВЫЙ БЕСПЛАТНЫЙ И СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ DUCKDUCKGO
 async function searchWebFree(query, timeoutMs) {
   if (timeoutMs < 150) return "";
   const controller = new AbortController();
@@ -78,9 +78,10 @@ async function searchWebFree(query, timeoutMs) {
   try {
     const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
     const response = await fetch(searchUrl, {
+      method: "GET",
       signal: controller.signal,
-      headers: { 
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" 
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
       }
     });
 
@@ -89,17 +90,17 @@ async function searchWebFree(query, timeoutMs) {
 
     const blocks = html.split('class="result__body"').slice(1, 4);
     const items = blocks.map((block, i) => {
-      const titleMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/);
+      const titleMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/) || block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
       const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
       
-      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 150) : "Сайт";
-      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 300) : "";
-      return `${i + 1}. ${title}: ${snippet}`;
+      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 180) : "Сайт";
+      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 350) : "";
+      return `${i + 1}. ${title}: ${snippet}`.trim();
     });
 
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Поиск не уложился в тайм-аут, продолжаем без интернета.");
+    console.warn("Free search failed or timed out:", error?.message);
     return "";
   } finally {
     clearTimeout(timer);
@@ -162,6 +163,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    console.warn("Gemini reached the output token limit.");
+  }
   return answer;
 }
 
@@ -214,7 +218,8 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2400)));
+      // Выполняем бесплатный поиск без требования SERPER_API_KEY
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
     const answer = await askGemini(
