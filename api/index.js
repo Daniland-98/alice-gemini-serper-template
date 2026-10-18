@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для бесплатного поиска
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -69,44 +69,41 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
-  const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+// НАШ НОВЫЙ БЕСПЛАТНЫЙ И СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ DUCKDUCKGO
+async function searchWebFree(query, timeoutMs) {
+  if (timeoutMs < 150) return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const { response, data } = await fetchJson(
-      "https://google.serper.dev/search",
-      {
-        method: "POST",
-        headers: {
-          "X-API-KEY": key,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
-      },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
-    );
+    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const response = await fetch(searchUrl, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    });
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
+    const html = await response.text();
 
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
+    const blocks = html.split('class="result__body"').slice(1, 4);
+    const items = blocks.map((block, i) => {
+      const titleMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/) || block.match(/class="result__a"[^>]*>([\s\S]*?)<\/a>/);
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+      
+      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 180) : "Сайт";
+      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 350) : "";
+      return `${i + 1}. ${title}: ${snippet}`.trim();
+    });
 
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn("Free search failed or timed out:", error?.message);
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -194,7 +191,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-gemini-free-search",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -220,9 +217,9 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (isSearchIntent(text)) {
+      // Выполняем бесплатный поиск без требования SERPER_API_KEY
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
     const answer = await askGemini(
