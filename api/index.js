@@ -3,8 +3,8 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 900; 
-const GEMINI_TIMEOUT_MS = 2400;
+const SEARCH_TIMEOUT_MS = 400; // Уменьшен до 400 мс, чтобы не крашить тайм-аут Алисы
+const GEMINI_TIMEOUT_MS = 2800;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -45,8 +45,9 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
+// Уточненная регулярка: ищем только ЯВНЫЕ запросы свежих данных
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(сегодня|сейчас|последние новости|курс валют|курс доллара|погода|прогноз погоды)\b/i.test(text);
 }
 
 function safeHistory(history) {
@@ -59,7 +60,7 @@ function safeHistory(history) {
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const timer = setTimeout(() => controller.abort(), Math.max(50, timeoutMs));
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
     const data = await response.json().catch(() => ({}));
@@ -69,58 +70,28 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// УНИВЕРСАЛЬНЫЙ СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ API
+// СВЕРХБЫСТРЫЙ ПОИСК С ТАЙМ-АУТОМ 400 МС
 async function searchWebFree(query, timeoutMs) {
-  if (timeoutMs < 150) return "";
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+  if (timeoutMs < 100) return "";
+  
   try {
-    // 1. DuckDuckGo Instant Answer API (факты, погода, справка)
     const apiUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1&kl=ru-ru`;
-    const apiRes = await fetch(apiUrl, { signal: controller.signal });
-    if (apiRes.ok) {
-      const apiData = await apiRes.json().catch(() => ({}));
-      if (apiData.Answer) return `Ответ поисковика: ${apiData.Answer}`;
-      if (apiData.AbstractText) return `Информация: ${apiData.AbstractText}`;
+    const { response, data } = await fetchJson(apiUrl, {}, timeoutMs);
+    
+    if (response?.ok) {
+      if (data.Answer) return `Ответ: ${data.Answer}`;
+      if (data.AbstractText) return `Информация: ${data.AbstractText}`;
     }
-
-    // 2. Если мгновенный ответ пуст, ищем в открытом Google News RSS
-    const rssUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ru&gl=RU&ceid=RU:ru`;
-    const rssRes = await fetch(rssUrl, {
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-    });
-
-    if (rssRes.ok) {
-      const xml = await rssRes.text();
-      const titles = [];
-      const regex = /<title>([\s\S]*?)<\/title>/g;
-      let match;
-      while ((match = regex.exec(xml)) !== null && titles.length < 4) {
-        const cleanTitle = match[1].replace(/<!\[CDATA\[\vert{}\]\]>/g, "").replace(/<[^>]*>/g, "").trim();
-        if (cleanTitle && !cleanTitle.includes("Google Новости")) {
-          titles.push(cleanTitle);
-        }
-      }
-      if (titles.length) {
-        return `Свежие данные из интернета:\n` + titles.map((t, i) => `${i + 1}. ${t}`).join("\n");
-      }
-    }
-
     return "";
-  } catch (error) {
-    console.warn("Search timed out or failed:", error?.message);
+  } catch {
     return "";
-  } finally {
-    clearTimeout(timer);
   }
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+  if (timeoutMs < 200) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
@@ -155,8 +126,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
   );
 
-  if (!response.ok) {
-    const status = Number(response.status);
+  if (!response?.ok) {
+    const status = Number(response?.status);
     console.error("Gemini request failed with HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
@@ -225,14 +196,14 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2500)));
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2800)));
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 500))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 400))
     );
 
     const history = [
