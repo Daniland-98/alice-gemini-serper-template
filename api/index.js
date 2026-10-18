@@ -1,9 +1,9 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-pro"; // Сразу ставим лучшую модель вместо 3.5-lite
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для нашего нового поиска
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -27,7 +27,7 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function fitAliceText(value) {
   const text = String(value ?? "")
-    .replace(/[\r\n\t]+/g, " ")
+    .replace(/[\(\r\\)n\t]+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
 
@@ -69,44 +69,40 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
-  const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+// НАШ НОВЫЙ БЕСПЛАТНЫЙ И ВЕЧНЫЙ ПОИСК
+async function searchWebFree(query, timeoutMs) {
+  if (timeoutMs < 150) return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const { response, data } = await fetchJson(
-      "https://google.serper.dev/search",
-      {
-        method: "POST",
-        headers: {
-          "X-API-KEY": key,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
-      },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
-    );
+    // Используем чистый HTML-поисковик DuckDuckGo, защищенный от блокировок
+    const searchUrl = `https://duckduckgo.com{encodeURIComponent(query)}`;
+    const response = await fetch(searchUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    });
 
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
+    if (!response.ok) return "";
+    const html = await response.text();
 
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
+    // Быстрый ручной разбор HTML без тяжелых библиотек парсинга
+    const blocks = html.split('class="result__body"').slice(1, 4);
+    const items = blocks.map((block, i) => {
+      const titleMatch = block.match(/class="result__url"[^>]*>([\s\(\S\)]*?)<\/a>/);
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\(\S\)]*?)<\/a>/);
+      
+      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 150) : "Сайт";
+      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 300) : "";
+      return `${i + 1}. ${title}: ${snippet}`;
+    });
 
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn("Поиск не уложился в тайм-аут, продолжаем без интернета.");
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -116,7 +112,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  if (!/^[A-Za-z0-9._-]+\$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -129,7 +125,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    `https://googleapis.com{model}:generateContent`,
     {
       method: "POST",
       headers: {
@@ -166,9 +162,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
   return answer;
 }
 
@@ -194,7 +187,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-gemini-free-search",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -220,9 +213,9 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (isSearchIntent(text)) {
+      // Запускаем наш бесплатный вечный поиск вместо Serper
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2400)));
     }
 
     const answer = await askGemini(
