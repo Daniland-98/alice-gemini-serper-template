@@ -1,10 +1,10 @@
-const DEFAULT_MODEL = "gemini-2.5-pro"; // Сразу ставим лучшую модель вместо 3.5-lite
+const DEFAULT_MODEL = "gemini-2.5-flash"; 
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 800; // Тайм-аут для нашего нового поиска
-const GEMINI_TIMEOUT_MS = 2500;
+const SEARCH_TIMEOUT_MS = 900; 
+const GEMINI_TIMEOUT_MS = 2400;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -69,14 +69,12 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// НАШ НОВЫЙ БЕСПЛАТНЫЙ И ВЕЧНЫЙ ПОИСК
 async function searchWebFree(query, timeoutMs) {
   if (timeoutMs < 150) return "";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    // Используем чистый HTML-поисковик DuckDuckGo, защищенный от блокировок
     const searchUrl = `https://duckduckgo.com{encodeURIComponent(query)}`;
     const response = await fetch(searchUrl, {
       signal: controller.signal,
@@ -86,16 +84,17 @@ async function searchWebFree(query, timeoutMs) {
     if (!response.ok) return "";
     const html = await response.text();
 
-    // Быстрый ручной разбор HTML без тяжелых библиотек парсинга
+    const items = [];
     const blocks = html.split('class="result__body"').slice(1, 4);
-    const items = blocks.map((block, i) => {
-      const titleMatch = block.match(/class="result__url"[^>]*>([\s\(\S\)]*?)<\/a>/);
+    
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
       const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\(\S\)]*?)<\/a>/);
-      
-      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 150) : "Сайт";
-      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 300) : "";
-      return `${i + 1}. ${title}: ${snippet}`;
-    });
+      if (snippetMatch && snippetMatch[1]) {
+        const snippet = snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 250);
+        if (snippet) items.push(`${i + 1}. ${snippet}`);
+      }
+    }
 
     return items.length ? items.join("\n") : "";
   } catch (error) {
@@ -214,7 +213,6 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      // Запускаем наш бесплатный вечный поиск вместо Serper
       searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2400)));
     }
 
