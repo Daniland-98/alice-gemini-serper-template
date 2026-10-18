@@ -1,10 +1,10 @@
-const DEFAULT_MODEL = "gemini-2.5-flash"; 
+const DEFAULT_MODEL = "gemini-2.5-pro";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SEARCH_TIMEOUT_MS = 1000; 
-const GEMINI_TIMEOUT_MS = 2200;
+const SEARCH_TIMEOUT_MS = 800;
+const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -69,31 +69,40 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-// Новый неубиваемый поиск через API быстрых ответов DuckDuckGo
+// БЕСПЛАТНЫЙ И СТАБИЛЬНЫЙ ПОИСК ЧЕРЕЗ DUCKDUCKGO HTML
 async function searchWebFree(query, timeoutMs) {
   if (timeoutMs < 150) return "";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const searchUrl = `https://duckduckgo.com{encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-    const { data } = await fetchJson(searchUrl, {
-      headers: { "User-Agent": "Mozilla/5.0" }
-    }, timeoutMs);
+    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const response = await fetch(searchUrl, {
+      signal: controller.signal,
+      headers: { 
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" 
+      }
+    });
 
-    let context = "";
-    if (data.AbstractText) {
-      context += data.AbstractText + "\n";
-    }
-    
-    if (Array.isArray(data.RelatedTopics)) {
-      const snippets = data.RelatedTopics
-        .slice(0, 3)
-        .map(topic => topic.Text)
-        .filter(text => typeof text === "string" && text.length > 10);
-      if (snippets.length) context += snippets.join("\n");
-    }
+    if (!response.ok) return "";
+    const html = await response.text();
 
-    return context.trim().slice(0, 800);
+    const blocks = html.split('class="result__body"').slice(1, 4);
+    const items = blocks.map((block, i) => {
+      const titleMatch = block.match(/class="result__url"[^>]*>([\s\S]*?)<\/a>/);
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
+      
+      const title = titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 150) : "Сайт";
+      const snippet = snippetMatch ? snippetMatch[1].replace(/<[^>]*>/g, "").trim().slice(0, 300) : "";
+      return `${i + 1}. ${title}: ${snippet}`;
+    });
+
+    return items.length ? items.join("\n") : "";
   } catch (error) {
+    console.warn("Поиск не уложился в тайм-аут, продолжаем без интернета.");
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -102,7 +111,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = DEFAULT_MODEL;
+  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
@@ -114,14 +125,20 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const { response, data } = await fetchJson(
-    `https://googleapis.com{model}:generateContent?key=${key}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": key
+      },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
-        generationConfig: { temperature: 0.4, maxOutputTokens: 300 }
+        generationConfig: {
+          temperature: 0.5,
+          maxOutputTokens: 240
+        }
       })
     },
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
@@ -129,16 +146,23 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini failed with HTTP", status);
+    console.error("Gemini request failed with HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  const answer = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!answer.trim()) throw new Error("GEMINI_EMPTY_RESPONSE");
-  
-  return answer.trim();
+  const candidate = data?.candidates?.[0];
+  const answer = (candidate?.content?.parts || [])
+    .map(part => typeof part.text === "string" ? part.text : "")
+    .join("")
+    .trim();
+
+  if (!answer) {
+    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    throw new Error("GEMINI_EMPTY_RESPONSE");
+  }
+  return answer;
 }
 
 function errorForUser(error) {
@@ -149,6 +173,8 @@ function errorForUser(error) {
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+    case "GEMINI_BLOCKED":
+      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -159,10 +185,15 @@ function errorForUser(error) {
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, message: "Server is online" });
+    return res.status(200).json({
+      ok: true,
+      service: "alice-gemini-free-search",
+      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+    });
   }
 
   if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
     return res.status(405).json({ error: "Method not allowed" });
   }
 
@@ -183,14 +214,14 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text)) {
-      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2200)));
+      searchContext = await searchWebFree(text, Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - 2400)));
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 400))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -202,6 +233,7 @@ export default async function handler(req, res) {
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
